@@ -41,8 +41,12 @@ namespace ErrorListTabCounter
     {
         private DTE2 _dte;
         private BuildEvents _buildEvents;
-        private System.Threading.Timer _timer;
-        private int _lastErrorCount = -1;
+        private SolutionEvents _solutionEvents;
+        private DocumentEvents _documentEvents;
+
+        private int _updateQueued = 0;
+        private int _lastCount = -1;
+
 
         /// <summary>
         /// VSPackage1 GUID string.
@@ -70,74 +74,116 @@ namespace ErrorListTabCounter
         /// <param name="progress">A provider for progress updates.</param>
         /// <returns>A task representing the async work of package initialization, or an already completed task if there is none. Do not return null from this method.</returns>
         protected override async Task InitializeAsync(
-            CancellationToken cancellationToken,
-            IProgress<ServiceProgressData> progress)
+         CancellationToken cancellationToken,
+         IProgress<ServiceProgressData> progress)
         {
             await JoinableTaskFactory.SwitchToMainThreadAsync(cancellationToken);
 
-            HookBuildEvents();
-            UpdateErrorListCaption();
+            _dte = (DTE2)await GetServiceAsync(typeof(DTE));
 
-            _timer = new System.Threading.Timer(_ =>
-            {
-                JoinableTaskFactory.RunAsync(async () =>
-                {
-                    await JoinableTaskFactory.SwitchToMainThreadAsync(cancellationToken);
-                    UpdateErrorListCaption();
-                });
-            }, null, System.TimeSpan.FromSeconds(1), System.TimeSpan.FromSeconds(1));
+            HookEvents();
+            QueueUpdateOnIdle();
         }
-
-        private void HookBuildEvents()
+        private void QueueUpdateOnIdle()
         {
-            ThreadHelper.ThrowIfNotOnUIThread();
-
-            _dte = (DTE2)GetService(typeof(DTE));
-            Events2 events2 = (Events2)_dte.Events;
-            _buildEvents = events2.BuildEvents;
-
-            _buildEvents.OnBuildBegin += (vsBuildScope scope, vsBuildAction action) =>
-    {
-        ThreadHelper.ThrowIfNotOnUIThread();
-        UpdateErrorListCaption();
-    };
-
-            _buildEvents.OnBuildDone += (vsBuildScope scope, vsBuildAction action) =>
-            {
-                ThreadHelper.ThrowIfNotOnUIThread();
-                UpdateErrorListCaption();
-            };
-
-        }
-
-        private void UpdateErrorListCaption()
-        {
-            ThreadHelper.ThrowIfNotOnUIThread();
-
-            int errorCount = GetErrorCount();
-
-            if (errorCount == _lastErrorCount)
+            if (System.Threading.Interlocked.Exchange(ref _updateQueued, 1) == 1)
             {
                 return;
             }
 
-            _lastErrorCount = errorCount;
+            JoinableTaskFactory.RunAsync(async () =>
+            {
+                try
+                {
+                    // Let VS finish whatever caused the change (build, analyzers, typing, etc.)
+                    await Task.Delay(250);
 
-            string caption = $"Errors ({errorCount})";
+                    await JoinableTaskFactory.SwitchToMainThreadAsync(CancellationToken.None);
+                    UpdateErrorListCaptionFast();
+                }
+                finally
+                {
+                    System.Threading.Interlocked.Exchange(ref _updateQueued, 0);
+                }
+            });
+        }
 
-            IVsUIShell uiShell = (IVsUIShell)GetService(typeof(SVsUIShell));
+        private void HookEvents()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            var events2 = (Events2)_dte.Events;
+
+            _buildEvents = events2.BuildEvents;
+            _solutionEvents = events2.SolutionEvents;
+            _documentEvents = events2.DocumentEvents;
+
+            _buildEvents.OnBuildBegin += (vsBuildScope scope, vsBuildAction action) =>
+            {
+                ThreadHelper.ThrowIfNotOnUIThread();
+                QueueUpdateOnIdle();
+            };
+
+            _buildEvents.OnBuildDone += (vsBuildScope scope, vsBuildAction action) =>
+            {
+                ThreadHelper.ThrowIfNotOnUIThread();
+                QueueUpdateOnIdle();
+            };
+
+            _documentEvents.DocumentSaved += (Document document) =>
+            {
+                ThreadHelper.ThrowIfNotOnUIThread();
+                QueueUpdateOnIdle();
+            };
+
+            _solutionEvents.Opened += () =>
+            {
+                ThreadHelper.ThrowIfNotOnUIThread();
+                QueueUpdateOnIdle();
+            };
+
+            _solutionEvents.AfterClosing += () =>
+            {
+                ThreadHelper.ThrowIfNotOnUIThread();
+                QueueUpdateOnIdle();
+            };
+        }
+
+
+        private void UpdateErrorListCaptionFast()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+
+            var count = GetErrorCountFast();
+
+            if (count == _lastCount)
+            {
+                return;
+            }
+
+            _lastCount = count;
+
+            var caption = $"Errors ({count})";
+
+            var uiShell = (IVsUIShell)GetService(typeof(SVsUIShell));
             if (uiShell == null)
             {
                 return;
             }
 
-            Guid errorListGuid = VSConstants.StandardToolWindows.ErrorList;
+            var errorListGuid = VSConstants.StandardToolWindows.ErrorList;
             uiShell.FindToolWindow(
                 (uint)__VSFINDTOOLWIN.FTW_fForceCreate,
                 ref errorListGuid,
-                out IVsWindowFrame frame);
+                out var frame);
 
             frame?.SetProperty((int)__VSFPROPID.VSFPROPID_Caption, caption);
+        }
+
+        private int GetErrorCountFast()
+        {
+            ThreadHelper.ThrowIfNotOnUIThread();
+            return _dte.ToolWindows.ErrorList.ErrorItems.Count;
         }
 
 
@@ -145,14 +191,14 @@ namespace ErrorListTabCounter
         {
             ThreadHelper.ThrowIfNotOnUIThread();
 
-            ErrorList errorList = _dte.ToolWindows.ErrorList;
-            ErrorItems items = errorList.ErrorItems;
+            var errorList = _dte.ToolWindows.ErrorList;
+            var items = errorList.ErrorItems;
 
-            int count = 0;
+            var count = 0;
 
-            for (int i = 1; i <= items.Count; i++)
+            for (var i = 1; i <= items.Count; i++)
             {
-                ErrorItem item = items.Item(i);
+                var item = items.Item(i);
                 if (item.ErrorLevel == vsBuildErrorLevel.vsBuildErrorLevelHigh)
                 {
                     count++;
@@ -161,16 +207,7 @@ namespace ErrorListTabCounter
 
             return count;
         }
-        protected override void Dispose(bool disposing)
-        {
-            if (disposing)
-            {
-                _timer?.Dispose();
-                _timer = null;
-            }
 
-            base.Dispose(disposing);
-        }
 
         #endregion
     }

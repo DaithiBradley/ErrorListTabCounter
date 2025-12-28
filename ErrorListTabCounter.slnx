@@ -4,7 +4,7 @@
     <Platform Name="arm64" />
     <Platform Name="x86" />
   </Configurations>
-  <Project Path="ErrorListTabCounter/ErrorListTabCounter.csproj">
+  <Project Path="ErrorListTabCounter/ErrorListTabCounter.csproj" Id="4cce0452-3f61-49f2-bc64-33aaa78bceb9">
     <Platform Solution="*|arm64" Project="arm64" />
     <Platform Solution="*|x86" Project="x86" />
   </Project>
